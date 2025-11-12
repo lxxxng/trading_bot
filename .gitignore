@@ -1,0 +1,38 @@
+.env
+/.venv
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+
+# SQLite / DB
+trades.db
+*.sqlite
+*.sqlite3
+
+# Virtualenvs
+env/
+venv/
+.venv/
+
+# Packaging / build
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+
+# Test / tooling
+.pytest_cache/
+coverage.xml
+
+# IDEs / editors
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OS
+.DS_Store
+Thumbs.db
