@@ -74,72 +74,43 @@ _day_state: Dict[str, Any] = {"date": None, "open_equity": None}
 # =========================
 
 def db_connect():
-    """Open a SQLite connection for the current thread."""
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL;")  # better concurrent reads
+    conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA foreign_keys=ON;")
     return conn
 
 def db_init():
-    """Create tables if they don't exist."""
     conn = db_connect()
     cur = conn.cursor()
 
-    # --- main trades table ---
+    # one row per completed trade
     cur.execute("""
     CREATE TABLE IF NOT EXISTS trades (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      ts_utc TEXT NOT NULL,               -- time trade was opened
-      instrument TEXT NOT NULL,
-      side TEXT NOT NULL,                 -- BUY or SELL
-      units INTEGER NOT NULL,
-      entry_est REAL NOT NULL,            -- estimated entry price
-      sl REAL NOT NULL,                   -- stop loss
-      tp REAL NOT NULL,                   -- take profit
-      mode TEXT NOT NULL,                 -- 'trend' or 'range'
-      granularity TEXT NOT NULL,
-      broker_tx_id TEXT,                  -- OANDA trade ID or lastTransactionID
-      realized_pl REAL DEFAULT 0.0,       -- profit/loss once closed
-      result TEXT DEFAULT NULL,           -- WIN / LOSS / EVEN
-      meta_json TEXT                      -- misc notes
+      open_ts_utc   TEXT NOT NULL,      -- time trade opened
+      close_ts_utc  TEXT NOT NULL,      -- time trade closed
+      instrument    TEXT NOT NULL,
+      granularity   TEXT NOT NULL,
+      side          TEXT NOT NULL,      -- LONG / SHORT
+      units         INTEGER NOT NULL,
+      entry_price   REAL NOT NULL,
+      exit_price    REAL NOT NULL,
+      sl_price      REAL NOT NULL,
+      tp_price      REAL NOT NULL,
+      pl            REAL NOT NULL,      -- in account currency
+      result        TEXT NOT NULL       -- WIN / LOSS / EVEN
     );
     """)
 
-    # --- equity snapshots ---
+    # optional, but handy for equity curve
     cur.execute("""
     CREATE TABLE IF NOT EXISTS equity (
-      ts_utc TEXT PRIMARY KEY,
-      equity REAL NOT NULL,
+      ts_utc     TEXT PRIMARY KEY,
+      equity     REAL NOT NULL,
       granularity TEXT NOT NULL
     );
     """)
 
-    # --- per-bar decisions (always log, even when FLAT) ---
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS decisions (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      ts_utc TEXT NOT NULL,
-      instrument TEXT NOT NULL,
-      granularity TEXT NOT NULL,
-      signal TEXT NOT NULL,               -- LONG | SHORT | FLAT
-      reason TEXT,                        -- 'flat' plus details (no_setup / late_friday / not_enough_bars)
-      close REAL,                         -- last close price
-      meta_json TEXT
-    );
-    """)
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_decisions_time ON decisions(ts_utc);")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_decisions_inst ON decisions(instrument, granularity);")
-
-    conn.commit()
-    conn.close()
-
-def log_trade(instrument: str, side: str, units: int, entry_est: float,
-              sl: float, tp: float, mode: str, gran: str, tx_id: str, meta_json: str):
-    conn = db_connect()
-    conn.execute("""
-        INSERT INTO trades (ts_utc, instrument, side, units, entry_est, sl, tp, mode, granularity, broker_tx_id, meta_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-    """, (utc_now_iso(), instrument, side, units, entry_est, sl, tp, mode, gran, tx_id, meta_json))
     conn.commit()
     conn.close()
 
@@ -152,14 +123,21 @@ def log_equity(equity: float, gran: str):
     conn.commit()
     conn.close()
 
-def log_decision(instrument: str, gran: str, signal: str, reason: str, close: float, meta: Dict[str, Any]):
+def log_trade_row(open_ts, close_ts, instrument, gran, side, units,
+                  entry, exit_px, sl, tp, pl, result):
     conn = db_connect()
     conn.execute("""
-        INSERT INTO decisions (ts_utc, instrument, granularity, signal, reason, close, meta_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?);
-    """, (utc_now_iso(), instrument, gran, signal, reason, close, json.dumps(meta, default=str)))
+        INSERT INTO trades (
+            open_ts_utc, close_ts_utc, instrument, granularity,
+            side, units, entry_price, exit_price,
+            sl_price, tp_price, pl, result
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+    """, (open_ts, close_ts, instrument, gran, side, units,
+          entry, exit_px, sl, tp, pl, result))
     conn.commit()
     conn.close()
+
 
 # =========================
 # Utility & Broker helpers
@@ -399,6 +377,7 @@ def trading_loop():
     print("[loop] started")
     while _running:
         try:
+            # 0) Read runtime config
             with _state_lock:
                 instrument = _state["instrument"]
                 gran = _state["granularity"]
@@ -411,14 +390,13 @@ def trading_loop():
 
             # 2) Equity & breaker
             equity = get_account_nav()
-            log_equity(equity, gran)                 # equity snapshot logging
+            log_equity(equity, gran)  # equity snapshot logging
+
             with _state_lock:
                 _state["last_equity"] = equity
+
             if not daily_breaker_ok(equity):
                 print(f"[breaker] Daily DD ≥ {DAILY_DD_PCT}% → pausing until next UTC day.")
-                # also log a flat decision due to breaker
-                close_px = float(df["c"].iloc[-1])
-                log_decision(instrument, gran, "FLAT", "flat:breaker", close_px, {"why":"daily_drawdown_limit"})
                 time.sleep(60)
                 continue
 
@@ -429,27 +407,26 @@ def trading_loop():
             with _state_lock:
                 last_side = _state["last_side"]
 
-            # 3a) Always log the decision (even FLAT)
-            reason = "executed" if signal in ("LONG", "SHORT") and signal != last_side else f"flat:{meta.get('why','n/a')}"
-            if signal == "FLAT" or signal == last_side:
-                # log immediately for non-trade (or same-direction suppression)
-                log_decision(instrument, gran, "FLAT", reason, close_px, {"meta": meta})
-
-            # 4) Execute if a *new* actionable signal
+            # 4) Execute only if new actionable signal (no same-direction stacking)
             if signal in ("LONG", "SHORT") and signal != last_side:
                 sl_pips = float(meta.get("sl_pips", SL_PIPS_FIXED))
                 tp_pips = float(meta.get("tp_pips", TP_PIPS_FIXED))
                 units = position_size(equity, sl_pips, instrument)
 
-                sl = price_add_pips(close_px, sl_pips, "SHORT" if signal == "LONG" else "LONG", instrument)
+                sl = price_add_pips(
+                    close_px,
+                    sl_pips,
+                    "SHORT" if signal == "LONG" else "LONG",
+                    instrument
+                )
                 tp = price_add_pips(close_px, tp_pips, signal, instrument)
                 bound = price_add_pips(close_px, sl_pips * 0.5, signal, instrument)
 
                 resp = market_order(instrument, signal, units, sl, tp, bound)
                 tx_id = str(resp.get("lastTransactionID"))
 
-                # 4a) Log the trade to SQLite
-                log_trade(
+                # Log core trade info only (no meta_json / decisions table)
+                log_trade_row(
                     instrument=instrument,
                     side="BUY" if signal == "LONG" else "SELL",
                     units=units,
@@ -459,14 +436,7 @@ def trading_loop():
                     mode=meta.get("mode", "n/a"),
                     gran=gran,
                     tx_id=tx_id,
-                    meta_json=json.dumps(meta, default=str)
                 )
-
-                # 4b) Log the decision row as executed
-                log_decision(instrument, gran, signal, "executed", close_px, {
-                    "mode": meta.get("mode", "n/a"),
-                    "units": units, "sl": sl, "tp": tp, "tx": tx_id
-                })
 
                 with _state_lock:
                     _state["last_side"] = signal
@@ -478,12 +448,15 @@ def trading_loop():
                         "units": units,
                         "sl": sl,
                         "tp": tp,
-                        "tx": tx_id
+                        "tx": tx_id,
                     }
 
-                print(f"[trade] {signal} {instrument} units={units} @≈{close_px:.5f} SL={sl:.5f} TP={tp:.5f} tx={tx_id}")
+                print(
+                    f"[trade] {signal} {instrument} units={units} "
+                    f"@≈{close_px:.5f} SL={sl:.5f} TP={tp:.5f} tx={tx_id}"
+                )
 
-            # 5) Sync closed trades
+            # 5) Sync closed trades → fills PL + WIN/LOSS/EVEN in DB
             update_closed_trades()
 
             # Sleep roughly a minute; strategy reacts on bar closes
@@ -494,6 +467,7 @@ def trading_loop():
             time.sleep(10)
 
     print("[loop] stopped")
+
 
 # =========================
 # Flask Endpoints

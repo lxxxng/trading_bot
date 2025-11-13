@@ -1,5 +1,8 @@
 .env
 /.venv
+/backtest_results
+/cache_hist
+
 # Python
 __pycache__/
 *.py[cod]
