@@ -1,6 +1,7 @@
 .env
 /.venv
-/backtest_results/*.db
+/backtest_results/*
+/backtest_results_v1/*.db
 /cache_hist
 
 # Python
