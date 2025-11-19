@@ -1,24 +1,23 @@
 """
 Pure backtest script for OANDA FX strategy with brute force parameter + strategy optimization.
 
-Key features:
 - Fetches historical candles from OANDA (practice or live, via ENV)
 - Caches candles in Parquet files (cache_hist/)
-- Regime-aware strategy:
+- Runs regime-aware strategy with enhancements:
     * Trend: Donchian + ATR breakout + Volume confirmation + Swing detection
     * Range: Bollinger + RSI mean reversion
     * Multi-timeframe confirmation (M5 + M15 alignment, via resample if enabled)
-    * Adaptive SL/TP based on volatility (while keeping RR ratio)
+    * Adaptive SL/TP based on volatility
     * Time-of-day liquidity filter
-- Brute force over:
+- Brute force tests combinations of:
     * STRATEGY_MODE ∈ {FULL, TREND_ONLY, RANGE_ONLY, NO_MTF}
-    * RISK_PCT, SL_PIPS, RR (TP = SL * RR), DAILY_MAX_LOSSES
+    * RISK_PCT
+    * SL_PIPS
+    * RR_MULT (TP = SL * RR_MULT, with adaptive scaling)
+    * DAILY_MAX_LOSSES (daily stop after N losing trades)
 - Logs trades & equity into per-config SQLite DBs under backtest_results/
-- Incrementally appends TRAIN results to summary_raw.csv to allow resume
-- Produces ranked summary.csv (sorted by SCORE = return_pct / max_dd_pct)
-- Train/test split:
-    * Optimize on first TRAIN_FRACTION of history
-    * Automatically re-run top configs on remaining data as TEST (printed)
+- Incrementally appends results to summary_raw.csv so runs can be resumed
+- Produces ranked summary.csv (sorted by win rate)
 """
 
 import os
@@ -32,10 +31,7 @@ import numpy as np
 import pandas as pd
 import requests
 from dotenv import load_dotenv
-
-# NEW: parallelism
-import multiprocessing
-from joblib import Parallel, delayed
+from joblib import Parallel, delayed, cpu_count
 
 # =========================
 # Config & Globals
@@ -65,23 +61,8 @@ BASE = (
 
 DB_PATH = os.getenv("BACKTEST_DB_PATH", "backtest_trades.db")
 
-START_EQUITY = float(os.getenv("START_EQUITY", "10000"))
+START_EQUITY = 10_000.0
 DAYS_BACK = int(os.getenv("DAYS_BACK", "1095"))
-
-# Approx spread in pips (round-trip) for EURUSD on M5
-SPREAD_PIPS = float(os.getenv("SPREAD_PIPS", "1.0"))
-
-# Train/test split fraction (e.g. 0.7 = first 70% train, last 30% test)
-TRAIN_FRACTION = float(os.getenv("TRAIN_FRACTION", "0.7"))
-
-# Minimum trades filter when ranking configs
-MIN_TRADES = int(os.getenv("MIN_TRADES", "200"))
-
-# Number of top configs (by score) to re-test on out-of-sample data
-TOP_N_TEST = int(os.getenv("TOP_N_TEST", "20"))
-
-# Optional: override n_jobs via ENV, else use cores-2
-N_JOBS_ENV = os.getenv("N_JOBS", "").strip()
 
 session = requests.Session()
 if not TOKEN:
@@ -97,28 +78,25 @@ os.makedirs(RESULTS_DIR, exist_ok=True)
 SUMMARY_RAW_PATH = os.path.join(RESULTS_DIR, "summary_raw.csv")
 SUMMARY_RANKED_PATH = os.path.join(RESULTS_DIR, "summary.csv")
 
-# Chunk size for parallel brute-force (for incremental CSV writing)
-CHUNK_SIZE = 20
-
 # =========================
 # Brute Force Parameter Ranges
 # =========================
 
 STRATEGY_MODES = ["FULL", "TREND_ONLY", "RANGE_ONLY", "NO_MTF"]
 
-RISK_PCT_RANGE = [0.01, 0.02, 0.03, 0.04, 0.05]      # 1% to 5% per trade
-SL_PIPS_RANGE   = [5, 8, 10, 12, 15, 18, 20]         # base SL in pips
-RR_RANGE        = [1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0]  # TP = SL * RR
-DAILY_LOSSES_RANGE = [1, 2, 3, 4, 5]                 # max losing trades per day
+RISK_PCT_RANGE = [0.01, 0.02, 0.03, 0.04, 0.05]  # 1% to 5% per trade
+SL_PIPS_RANGE = [5, 8, 10, 12, 15]                  # base SL in pips
+R_MULT_RANGE = [1.25, 1.5, 1.75, 2.0, 2.5, 3.0]  # TP = SL * R_MULT
+DAILY_MAX_LOSSES_RANGE = [1, 2, 3, 4, 5]         # max losing trades per day
 
-# (strategy_mode, risk_pct, sl_pips, rr, daily_max_losses)
+# (strategy_mode, risk_pct, sl_pips, r_mult, daily_max_losses)
 PARAM_CONFIGS = list(
     itertools.product(
         STRATEGY_MODES,
         RISK_PCT_RANGE,
         SL_PIPS_RANGE,
-        RR_RANGE,
-        DAILY_LOSSES_RANGE,
+        R_MULT_RANGE,
+        DAILY_MAX_LOSSES_RANGE,
     )
 )
 
@@ -484,33 +462,32 @@ def swing_setup(df: pd.DataFrame, n=3) -> Tuple[bool, bool]:
     return up_swing, dn_swing
 
 
-# ========== Enhancement 4: Adaptive SL/TP ==========
+# ========== Enhancement 4: Adaptive SL/TP with RR multiple ==========
 
 def adaptive_sl_tp(
     atr_pct: float,
     sl_base: float,
-    tp_base: float,
+    r_mult: float,
     use_adaptive: bool,
 ) -> Tuple[float, float]:
     """
-    Adjust SL/TP based on volatility regime:
-    - High volatility (atr_pct > 75): wider stops
-    - Low volatility (atr_pct < 25): tighter stops
-    - Mid regime: use base values
+    Adjust SL/TP based on volatility regime while preserving RR multiple:
+
+    - High volatility (atr_pct > 75): wider stops (SL * 1.5, TP = SL * r_mult)
+    - Low volatility  (atr_pct < 25): tighter stops (SL * 0.7, TP = SL * r_mult)
+    - Mid regime: use base SL, TP = SL * r_mult
     """
     if not use_adaptive:
-        return sl_base, tp_base
-
-    if atr_pct > 75:
-        sl = sl_base * 1.5
-        tp = tp_base * 1.5
-    elif atr_pct < 25:
-        sl = sl_base * 0.7
-        tp = tp_base * 0.7
-    else:
         sl = sl_base
-        tp = tp_base
+    else:
+        if atr_pct > 75:
+            sl = sl_base * 1.5
+        elif atr_pct < 25:
+            sl = sl_base * 0.7
+        else:
+            sl = sl_base
 
+    tp = sl * r_mult
     return sl, tp
 
 
@@ -558,7 +535,7 @@ def _compute_signal_single_tf(
     df: pd.DataFrame,
     instrument: str,
     sl_pips_fixed: float,
-    rr: float,
+    r_mult: float,
     strategy_mode: str,
     use_volume_confirm: bool,
     use_time_filter: bool,
@@ -587,8 +564,8 @@ def _compute_signal_single_tf(
     if use_time_filter and not is_liquid_hour(ts):
         return "FLAT", {"why": "illiquid_hour"}
 
-    trend_regime = atr_pct >= 70
-    range_regime = atr_pct <= 30
+    trend_regime = atr_pct >= 65
+    range_regime = atr_pct <= 35
 
     # --- Strategy-mode gating ---
     use_trend_block = strategy_mode in ("FULL", "TREND_ONLY", "NO_MTF")
@@ -617,8 +594,7 @@ def _compute_signal_single_tf(
                     return "FLAT", {"why": "no_upswing"}
 
             sl_pips = max(sl_pips_fixed, 2.0 * (atr_now / pip_value(instrument)))
-            tp_pips = sl_pips * rr
-            sl_pips, tp_pips = adaptive_sl_tp(atr_pct, sl_pips, tp_pips, use_adaptive_sltp)
+            sl_pips, tp_pips = adaptive_sl_tp(atr_pct, sl_pips, r_mult, use_adaptive_sltp)
 
             return "LONG", {"mode": "trend", "sl_pips": sl_pips, "tp_pips": tp_pips}
 
@@ -632,28 +608,25 @@ def _compute_signal_single_tf(
                     return "FLAT", {"why": "no_dnswing"}
 
             sl_pips = max(sl_pips_fixed, 2.0 * (atr_now / pip_value(instrument)))
-            tp_pips = sl_pips * rr
-            sl_pips, tp_pips = adaptive_sl_tp(atr_pct, sl_pips, tp_pips, use_adaptive_sltp)
+            sl_pips, tp_pips = adaptive_sl_tp(atr_pct, sl_pips, r_mult, use_adaptive_sltp)
 
             return "SHORT", {"mode": "trend", "sl_pips": sl_pips, "tp_pips": tp_pips}
 
-    # --- Range regime: Bollinger + RSI ---
+    # --- Range regime: Bollinger + RSI mean reversion ---
     if use_range_block and range_regime:
         rsi_val = df["RSI14"].iloc[-1]
 
         # Long mean-reversion
         if (c < bb_lo.iloc[-1]) and (rsi_val < 30):
             sl_pips = sl_pips_fixed
-            tp_pips = sl_pips * rr
-            sl_pips, tp_pips = adaptive_sl_tp(atr_pct, sl_pips, tp_pips, use_adaptive_sltp)
+            sl_pips, tp_pips = adaptive_sl_tp(atr_pct, sl_pips, r_mult, use_adaptive_sltp)
 
             return "LONG", {"mode": "range", "sl_pips": sl_pips, "tp_pips": tp_pips}
 
         # Short mean-reversion
         if (c > bb_up.iloc[-1]) and (rsi_val > 70):
             sl_pips = sl_pips_fixed
-            tp_pips = sl_pips * rr
-            sl_pips, tp_pips = adaptive_sl_tp(atr_pct, sl_pips, tp_pips, use_adaptive_sltp)
+            sl_pips, tp_pips = adaptive_sl_tp(atr_pct, sl_pips, r_mult, use_adaptive_sltp)
 
             return "SHORT", {"mode": "range", "sl_pips": sl_pips, "tp_pips": tp_pips}
 
@@ -664,7 +637,7 @@ def compute_signal(
     df: pd.DataFrame,
     instrument: str,
     sl_pips_fixed: float,
-    rr: float,
+    r_mult: float,
     strategy_mode: str,
 ) -> Tuple[str, Dict[str, Any]]:
     """
@@ -684,7 +657,7 @@ def compute_signal(
         df,
         instrument,
         sl_pips_fixed,
-        rr,
+        r_mult,
         strategy_mode,
         use_volume_confirm,
         use_time_filter,
@@ -709,7 +682,7 @@ def compute_signal(
         df_m15,
         instrument,
         sl_pips_fixed,
-        rr,
+        r_mult,
         strategy_mode,
         use_volume_confirm,
         use_time_filter,
@@ -737,8 +710,6 @@ def compute_signal(
 def position_size(nav: float, sl_pips: float, instrument: str, risk_pct: float) -> int:
     """Position sizing based on risk per trade."""
     risk_amount = nav * risk_pct
-    if sl_pips <= 0:
-        return 0
     units = risk_amount / (sl_pips * pip_value(instrument))
     return max(1, int(units))
 
@@ -754,7 +725,7 @@ def simulate_backtest(
     start_equity: float,
     risk_pct: float,
     sl_pips: float,
-    rr: float,
+    r_mult: float,
     daily_max_losses: int,
     strategy_mode: str,
     config_name: str,
@@ -767,9 +738,6 @@ def simulate_backtest(
     db_init(db_path)
 
     equity = start_equity
-    equity_peak = start_equity
-    max_dd_pct = 0.0
-
     position: Optional[Dict[str, Any]] = None
 
     trade_count = 0
@@ -777,13 +745,10 @@ def simulate_backtest(
     loss_count = 0
     total_pl = 0.0
 
-    # Daily loss-limit tracking
+    # Daily loss limit tracking
     current_day = None
-    daily_loss_count = 0
-    daily_limit_hit = False  # stop new entries for the day once hit
-
-    # For reporting: base TP for this config (before adaptive scaling)
-    base_tp_pips = sl_pips * rr
+    day_loss_count = 0
+    daily_loss_limit_hit = False  # stop new entries for the day once hit
 
     for i in range(100, len(df)):
         bar = df.iloc[i]
@@ -794,8 +759,8 @@ def simulate_backtest(
         day = t_bar.date()
         if current_day is None or day != current_day:
             current_day = day
-            daily_loss_count = 0
-            daily_limit_hit = False
+            day_loss_count = 0
+            daily_loss_limit_hit = False
 
         # 1) Manage open position
         if position is not None:
@@ -805,36 +770,22 @@ def simulate_backtest(
 
             exit_price = None
 
-            # Explicit worst-case bar logic if both SL and TP inside same bar
             if side == "LONG":
-                sl_hit = l <= sl
-                tp_hit = h >= tp
-                if sl_hit and tp_hit:
-                    # worst-case assumption: SL first
+                if l <= sl:
                     exit_price = sl
-                elif sl_hit:
-                    exit_price = sl
-                elif tp_hit:
+                elif h >= tp:
                     exit_price = tp
             else:  # SHORT
-                sl_hit = h >= sl
-                tp_hit = l <= tp
-                if sl_hit and tp_hit:
-                    exit_price = sl  # worst-case: SL first
-                elif sl_hit:
+                if h >= sl:
                     exit_price = sl
-                elif tp_hit:
+                elif l <= tp:
                     exit_price = tp
 
             if exit_price is not None:
                 units = position["units"]
                 entry = position["entry"]
                 side_mult = 1 if side == "LONG" else -1
-
-                # P&L including spread cost (round-trip)
-                spread_cost = SPREAD_PIPS * pip_value(instrument) * units
-                pl = (exit_price - entry) * units * side_mult - spread_cost
-
+                pl = (exit_price - entry) * units * side_mult
                 equity += pl
                 total_pl += pl
 
@@ -854,8 +805,8 @@ def simulate_backtest(
                     pl=pl,
                     result=result,
                     risk_pct=risk_pct,
-                    sl_pips=sl_pips,
-                    tp_pips=base_tp_pips,
+                    sl_pips=position.get("sl_pips", sl_pips),
+                    tp_pips=position.get("tp_pips", sl_pips * r_mult),
                     db_path=db_path,
                 )
 
@@ -863,27 +814,21 @@ def simulate_backtest(
                     win_count += 1
                 elif result == "LOSS":
                     loss_count += 1
-                    daily_loss_count += 1
+                    day_loss_count += 1
 
                 position = None
 
-        # 2) Check daily loss limit
-        if not daily_limit_hit and daily_loss_count >= daily_max_losses:
-            daily_limit_hit = True
+        # 2) Check daily loss limit state (after P&L impact)
+        if not daily_loss_limit_hit and day_loss_count >= daily_max_losses:
+            daily_loss_limit_hit = True
 
-        # 3) Track max drawdown
-        equity_peak = max(equity_peak, equity)
-        if equity_peak > 0:
-            dd_pct = (equity_peak - equity) / equity_peak * 100.0
-            max_dd_pct = max(max_dd_pct, dd_pct)
-
-        # 4) Log equity using bar time
+        # 3) Log equity using bar time
         log_equity(equity, gran, risk_pct, ts_utc=t_bar.isoformat(), db_path=db_path)
 
-        # 5) Check for new signal (if no open position & daily loss limit not hit)
-        if position is None and not daily_limit_hit:
+        # 4) Check for new signal (if no open position & daily loss limit not hit)
+        if position is None and not daily_loss_limit_hit:
             window = df.iloc[: i + 1].copy()
-            signal, meta = compute_signal(window, instrument, sl_pips, rr, strategy_mode)
+            signal, meta = compute_signal(window, instrument, sl_pips, r_mult, strategy_mode)
             if signal not in ("LONG", "SHORT"):
                 continue
 
@@ -893,7 +838,7 @@ def simulate_backtest(
                 actual_side = signal
 
             sl_pips_calc = float(meta.get("sl_pips", sl_pips))
-            tp_pips_calc = float(meta.get("tp_pips", base_tp_pips))
+            tp_pips_calc = float(meta.get("tp_pips", sl_pips * r_mult))
 
             units = position_size(equity, sl_pips_calc, instrument, risk_pct)
             if units <= 0:
@@ -915,11 +860,13 @@ def simulate_backtest(
                 "entry": entry,
                 "sl": sl_price,
                 "tp": tp_price,
+                "sl_pips": sl_pips_calc,
+                "tp_pips": tp_pips_calc,
             }
 
             trade_count += 1
 
-    # 6) Close any remaining open position at last bar close
+    # 5) Close any remaining open position at last bar close
     if position is not None:
         last_bar = df.iloc[-1]
         t_last = pd.to_datetime(last_bar["t"], utc=True)
@@ -929,9 +876,7 @@ def simulate_backtest(
         entry = position["entry"]
 
         side_mult = 1 if side == "LONG" else -1
-        spread_cost = SPREAD_PIPS * pip_value(instrument) * units
-        pl = (c_last - entry) * units * side_mult - spread_cost
-
+        pl = (c_last - entry) * units * side_mult
         equity += pl
         total_pl += pl
         result = "WIN" if pl > 0 else "LOSS" if pl < 0 else "EVEN"
@@ -950,8 +895,8 @@ def simulate_backtest(
             pl=pl,
             result=result,
             risk_pct=risk_pct,
-            sl_pips=sl_pips,
-            tp_pips=base_tp_pips,
+            sl_pips=position.get("sl_pips", sl_pips),
+            tp_pips=position.get("tp_pips", sl_pips * r_mult),
             db_path=db_path,
         )
 
@@ -960,17 +905,8 @@ def simulate_backtest(
         elif result == "LOSS":
             loss_count += 1
 
-        # final equity already accounted
-
     win_rate = (win_count / trade_count * 100) if trade_count > 0 else 0.0
     return_pct = ((equity - start_equity) / start_equity * 100) if start_equity > 0 else 0.0
-    pl_per_trade = (total_pl / trade_count) if trade_count > 0 else 0.0
-
-    # Simple robustness score: return / max_dd
-    if max_dd_pct > 0:
-        score = return_pct / max_dd_pct
-    else:
-        score = return_pct  # no drawdown case
 
     return {
         "strategy_mode": strategy_mode,
@@ -982,64 +918,50 @@ def simulate_backtest(
         "total_pl": round(total_pl, 2),
         "final_equity": round(equity, 2),
         "return_pct": round(return_pct, 2),
-        "max_dd_pct": round(max_dd_pct, 2),
-        "pl_per_trade": round(pl_per_trade, 4),
-        "score": round(score, 4),
         "db_path": db_path,
         "risk_pct": risk_pct,
         "sl_pips": sl_pips,
-        "tp_pips": base_tp_pips,
+        "rr_mult": r_mult,
         "daily_max_losses": daily_max_losses,
     }
 
 
 # =========================
-# Parallel worker for TRAIN
+# Joblib helper for parallel configs
 # =========================
 
-def run_one_train_config(args):
-    (
-        strategy_mode,
-        risk_pct,
-        sl_pips,
-        rr,
-        daily_max_losses,
-        instr,
-        gran,
-        start_equity,
-        df_train,
-    ) = args
+def run_single_config(
+    df_hist: pd.DataFrame,
+    instr: str,
+    gran: str,
+    params: Tuple[str, float, float, float, int],
+) -> Optional[Dict[str, Any]]:
+    strategy_mode, risk_pct, sl_pips, r_mult, daily_max_losses = params
+    config_name = f"{strategy_mode}_R{risk_pct:.2f}_SL{sl_pips}_RR{r_mult}_DL{daily_max_losses}"
 
-    config_name = f"{strategy_mode}_R{risk_pct:.2f}_SL{sl_pips}_RR{rr}_DL{daily_max_losses}"
-    print(f"[TRAIN] {config_name} ...", flush=True)
-
+    print(f"[job] Testing: {config_name}", flush=True)
     try:
         result = simulate_backtest(
-            df_train,
+            df_hist,
             instrument=instr,
             gran=gran,
-            start_equity=start_equity,
+            start_equity=START_EQUITY,
             risk_pct=risk_pct,
             sl_pips=sl_pips,
-            rr=rr,
+            r_mult=r_mult,
             daily_max_losses=daily_max_losses,
             strategy_mode=strategy_mode,
             config_name=config_name,
         )
+        print(
+            f"[job] Done: {config_name} | {result['total_trades']} trades | "
+            f"{result['win_rate_pct']}% WR | ${result['total_pl']} PL",
+            flush=True,
+        )
         return result
     except Exception as e:
-        print(f"[ERROR] TRAIN {config_name}: {e}")
+        print(f"[job] Error in {config_name}: {e}", flush=True)
         return None
-
-
-# =========================
-# Helper: chunking
-# =========================
-
-def chunked(iterable, size):
-    """Yield successive chunks of length `size` from `iterable`."""
-    for i in range(0, len(iterable), size):
-        yield iterable[i : i + size]
 
 
 # =========================
@@ -1053,105 +975,67 @@ if __name__ == "__main__":
     print(f"\n[main] Loading historical data: {instr} {gran}...")
     df_hist = load_or_fetch_history(instr, gran, days_back=DAYS_BACK)
 
-    if len(df_hist) < 200:
-        raise SystemExit("Not enough candles for train/test.")
-
-    split_idx = int(len(df_hist) * TRAIN_FRACTION)
-    df_train = df_hist.iloc[:split_idx].reset_index(drop=True)
-    df_test = df_hist.iloc[split_idx:].reset_index(drop=True)
-
-    print(f"[main] Train size: {len(df_train)} bars, Test size: {len(df_test)} bars")
-
-    # --- Load existing partial results to enable resume (TRAIN phase) ---
+    # --- Load existing partial results to enable resume ---
     done_configs = set()
     if os.path.exists(SUMMARY_RAW_PATH):
         try:
             existing = pd.read_csv(SUMMARY_RAW_PATH)
             if "config" in existing.columns:
                 done_configs = set(existing["config"].astype(str))
-                print(f"[resume] Found {len(done_configs)} completed TRAIN configs in summary_raw.csv")
+                print(f"[resume] Found {len(done_configs)} completed configs in summary_raw.csv")
         except Exception as e:
             print(f"[resume] Could not read existing summary_raw.csv: {e}")
             done_configs = set()
 
-    print(f"\n[main] Starting TRAIN brute force with {len(PARAM_CONFIGS)} configurations...\n")
+    print(f"\n[main] Starting brute force backtest with {len(PARAM_CONFIGS)} configurations...\n")
 
-    # Build task list for joblib (only configs not done)
-    tasks = []
-    for (strategy_mode, risk_pct, sl_pips, rr, daily_max_losses) in PARAM_CONFIGS:
-        config_name = f"{strategy_mode}_R{risk_pct:.2f}_SL{sl_pips}_RR{rr}_DL{daily_max_losses}"
+    # Build list of configs that still need to be run
+    configs_to_run: list[Tuple[str, float, float, float, int]] = []
+    for (strategy_mode, risk_pct, sl_pips, r_mult, daily_max_losses) in PARAM_CONFIGS:
+        config_name = f"{strategy_mode}_R{risk_pct:.2f}_SL{sl_pips}_RR{r_mult}_DL{daily_max_losses}"
         if config_name in done_configs:
-            print(f"[skip] Already completed TRAIN: {config_name}")
+            print(f"[skip] Already completed: {config_name}")
             continue
+        configs_to_run.append((strategy_mode, risk_pct, sl_pips, r_mult, daily_max_losses))
 
-        tasks.append(
-            (
-                strategy_mode,
-                risk_pct,
-                sl_pips,
-                rr,
-                daily_max_losses,
-                instr,
-                gran,
-                START_EQUITY,
-                df_train,
-            )
+    if not configs_to_run:
+        print("[main] No new configurations to run.")
+    else:
+        print(
+            f"[main] Running {len(configs_to_run)} configs in parallel "
+            f"on {cpu_count()} CPU cores..."
         )
 
-    if not tasks:
-        print("[main] No new TRAIN configs to run.")
-        run_results = []
-    else:
-        CORES = multiprocessing.cpu_count()
-        if N_JOBS_ENV:
-            try:
-                N_JOBS = int(N_JOBS_ENV)
-            except ValueError:
-                N_JOBS = max(1, CORES - 2)
-        else:
-            N_JOBS = max(1, CORES - 2)
+        # Run in parallel; each job returns a result dict or None
+        parallel_results = Parallel(n_jobs=-1, backend="loky")(
+            delayed(run_single_config)(df_hist, instr, gran, p) for p in configs_to_run
+        )
 
-        print(f"[main] Using {N_JOBS} parallel workers out of {CORES} cores")
-        print(f"[main] Will run {len(tasks)} TRAIN configs in parallel (chunk size = {CHUNK_SIZE})\n")
+        # Filter out failed runs
+        run_results = [r for r in parallel_results if r is not None]
 
-        run_results = []
-        total_tasks = len(tasks)
-        total_chunks = (total_tasks + CHUNK_SIZE - 1) // CHUNK_SIZE
-
-        # Run TRAIN configs in parallel, chunked, and append to summary_raw.csv incrementally
-        for chunk_idx, task_chunk in enumerate(chunked(tasks, CHUNK_SIZE), start=1):
-            print(f"[main] Running TRAIN chunk {chunk_idx}/{total_chunks} with {len(task_chunk)} configs")
-
-            results = Parallel(n_jobs=N_JOBS, backend="loky", verbose=10)(
-                delayed(run_one_train_config)(args) for args in task_chunk
-            )
-
-            for result in results:
-                if result is None:
-                    continue
-
-                run_results.append(result)
-
-                # Append this result to summary_raw.csv (single-writer, main process only)
-                df_row = pd.DataFrame([result])
-                write_header = not os.path.exists(SUMMARY_RAW_PATH)
-                df_row.to_csv(
+        # Append results to summary_raw.csv sequentially
+        if run_results:
+            df_new = pd.DataFrame(run_results)
+            if os.path.exists(SUMMARY_RAW_PATH):
+                df_new.to_csv(
                     SUMMARY_RAW_PATH,
                     mode="a",
                     index=False,
-                    header=write_header,
+                    header=False,  # file already has header
+                )
+            else:
+                df_new.to_csv(
+                    SUMMARY_RAW_PATH,
+                    mode="w",
+                    index=False,
+                    header=True,
                 )
 
-                print(
-                    f"[TRAIN DONE] {result['config']}: "
-                    f"{result['total_trades']} trades | {result['win_rate_pct']}% WR | "
-                    f"{result['return_pct']}% return | score={result['score']}"
-                )
-
-    # === Build ranked TRAIN summary from summary_raw.csv (all runs, old+new) ===
+    # === Build ranked summary from summary_raw.csv (all runs, old+new) ===
     if os.path.exists(SUMMARY_RAW_PATH):
         print("\n" + "=" * 120)
-        print("TRAIN BRUTE FORCE SUMMARY (ALL COMPLETED CONFIGS)")
+        print("BRUTE FORCE BACKTEST SUMMARY (ALL COMPLETED CONFIGS)")
         print("=" * 120)
 
         df_all = pd.read_csv(SUMMARY_RAW_PATH)
@@ -1159,235 +1043,36 @@ if __name__ == "__main__":
         # Drop duplicate configs, keep the last occurrence
         df_all = df_all.drop_duplicates(subset=["config"], keep="last").reset_index(drop=True)
 
-        # Filter: minimum trades + positive return
-        df_all = df_all[df_all["total_trades"] >= MIN_TRADES].copy()
-        df_all = df_all[df_all["return_pct"] > 0].copy()
+        # Rank by win_rate_pct descending
+        df_all = df_all.sort_values("win_rate_pct", ascending=False).reset_index(drop=True)
+        df_all.insert(0, "rank", df_all.index + 1)
 
-        if df_all.empty:
-            print("[summary] No configs meet MIN_TRADES and positive return filter.")
-        else:
-            # Recompute score if missing
-            if "score" not in df_all.columns or df_all["score"].isna().any():
-                max_dd = df_all["max_dd_pct"].replace(0, np.nan)
-                df_all["score"] = df_all["return_pct"] / max_dd
-                df_all["score"] = df_all["score"].fillna(df_all["return_pct"])
-
-            # Rank by robustness score
-            df_all = df_all.sort_values("score", ascending=False).reset_index(drop=True)
-            df_all.insert(0, "rank", df_all.index + 1)
-
-            print(
-                df_all[
-                    [
-                        "rank",
-                        "strategy_mode",
-                        "config",
-                        "total_trades",
-                        "wins",
-                        "losses",
-                        "win_rate_pct",
-                        "total_pl",
-                        "return_pct",
-                        "max_dd_pct",
-                        "score",
-                    ]
-                ].to_string(index=False)
-            )
-
-            # Save ranked summary
-            df_all.to_csv(SUMMARY_RANKED_PATH, index=False)
-            print(f"\n[saved] ranked TRAIN summary -> {SUMMARY_RANKED_PATH}")
-
-            # Top 3 (TRAIN)
-            print("\n" + "=" * 120)
-            print("TOP 3 TRAIN CONFIGURATIONS (by score)")
-            print("=" * 120)
-            for _, row in df_all.head(3).iterrows():
-                print(f"\n#{int(row['rank'])}: {row['config']} ({row['strategy_mode']})")
-                print(
-                    f"    Trades: {row['total_trades']} | Win Rate: {row['win_rate_pct']}% | "
-                    f"Return: {row['return_pct']}% | Max DD: {row['max_dd_pct']}% | Score: {row['score']}"
-                )
-                print(f"    DB: {row['db_path']}")
-
-            # === Re-test top N configs on TEST set ===
-            print("\n" + "=" * 120)
-            print(f"OUT-OF-SAMPLE TEST on last {(1-TRAIN_FRACTION)*100:.1f}% of data")
-            print("=" * 120)
-
-            top_for_test = df_all.head(min(TOP_N_TEST, len(df_all))).copy()
-
-            test_results = []
-            for _, row in top_for_test.iterrows():
-                # Recover parameters
-                strategy_mode = row["strategy_mode"]
-                risk_pct = float(row["risk_pct"])
-                sl_pips = float(row["sl_pips"])
-                tp_pips = float(row["tp_pips"])
-                rr = tp_pips / sl_pips if sl_pips > 0 else 1.0
-                daily_max_losses = int(row["daily_max_losses"])
-                base_config_name = str(row["config"])
-                test_config_name = base_config_name + "_TEST"
-
-                print(f"\n[TEST] {test_config_name} ...", end=" ")
-
-                try:
-                    res_test = simulate_backtest(
-                        df_test,
-                        instrument=instr,
-                        gran=gran,
-                        start_equity=START_EQUITY,
-                        risk_pct=risk_pct,
-                        sl_pips=sl_pips,
-                        rr=rr,
-                        daily_max_losses=daily_max_losses,
-                        strategy_mode=strategy_mode,
-                        config_name=test_config_name,
-                    )
-                    # attach original train config name so we can merge later
-                    res_test["train_config"] = base_config_name
-
-                    test_results.append(res_test)
-                    print(
-                        f"✓ trades={res_test['total_trades']} | WR={res_test['win_rate_pct']}% | "
-                        f"ret={res_test['return_pct']}% | DD={res_test['max_dd_pct']}% | score={res_test['score']}"
-                    )
-                except Exception as e:
-                    print(f"✗ Error: {e}")
-
-            if test_results:
-                df_test_res = pd.DataFrame(test_results)
-
-                print("\n" + "=" * 120)
-                print("TEST RESULTS (TOP CONFIGS, OUT-OF-SAMPLE)")
-                print("=" * 120)
-
-                # Sort TEST results by score (this is score_test)
-                df_test_res = df_test_res.sort_values("score", ascending=False).reset_index(drop=True)
-                df_test_res.insert(0, "rank", df_test_res.index + 1)  # test_rank
-
-                print(
-                    df_test_res[
-                        [
-                            "rank",            # test rank
-                            "strategy_mode",
-                            "config",
-                            "total_trades",
-                            "win_rate_pct",
-                            "total_pl",
-                            "return_pct",
-                            "max_dd_pct",
-                            "score",
-                        ]
-                    ].to_string(index=False)
-                )
-
-                # === TRAIN vs TEST comparison + overfit flag + overall ranking ===
-                print("\n" + "=" * 120)
-                print("TRAIN vs TEST COMPARISON (OVERALL RANKING & OVERFIT CHECK)")
-                print("=" * 120)
-
-                # TRAIN metrics (df_all is the TRAIN summary already ranked by score)
-                train_cols = [
+        print(
+            df_all[
+                [
+                    "rank",
+                    "strategy_mode",
                     "config",
                     "total_trades",
+                    "wins",
+                    "losses",
+                    "win_rate_pct",
+                    "total_pl",
                     "return_pct",
-                    "max_dd_pct",
-                    "score",
-                    "rank",          # train rank from summary.csv
                 ]
-                df_train_merge = df_all[train_cols].copy()
-                df_train_merge = df_train_merge.rename(
-                    columns={
-                        "config": "train_config",
-                        "total_trades": "total_trades_train",
-                        "return_pct": "return_pct_train",
-                        "max_dd_pct": "max_dd_pct_train",
-                        "score": "score_train",
-                        "rank": "train_rank",
-                    }
-                )
+            ].to_string(index=False)
+        )
 
-                # TEST metrics (train_config added above)
-                test_cols = [
-                    "train_config",
-                    "total_trades",
-                    "return_pct",
-                    "max_dd_pct",
-                    "score",
-                    "rank",          # test rank
-                ]
-                df_test_merge = df_test_res[test_cols].copy()
-                df_test_merge = df_test_merge.rename(
-                    columns={
-                        "total_trades": "total_trades_test",
-                        "return_pct": "return_pct_test",
-                        "max_dd_pct": "max_dd_pct_test",
-                        "score": "score_test",
-                        "rank": "test_rank",
-                    }
-                )
+        # Save ranked summary
+        df_all.to_csv(SUMMARY_RANKED_PATH, index=False)
+        print(f"\n[saved] ranked summary -> {SUMMARY_RANKED_PATH}")
 
-                # Merge TRAIN + TEST on train_config
-                df_cmp = pd.merge(df_train_merge, df_test_merge, on="train_config", how="inner")
-
-                if df_cmp.empty:
-                    print("[cmp] No TRAIN/TEST pairs to compare.")
-                else:
-                    # Score difference (%): how much score changed from TRAIN to TEST
-                    df_cmp["score_diff_pct"] = np.where(
-                        df_cmp["score_train"] != 0,
-                        (df_cmp["score_test"] - df_cmp["score_train"]) / df_cmp["score_train"] * 100.0,
-                        np.nan,
-                    )
-
-                    # Overfit rules
-                    cond_score_drop   = df_cmp["score_test"] < df_cmp["score_train"] * 0.5
-                    cond_ret_drop     = df_cmp["return_pct_test"] < df_cmp["return_pct_train"] * 0.4
-                    cond_dd_worse     = df_cmp["max_dd_pct_test"] > df_cmp["max_dd_pct_train"] * 2.0
-                    cond_trades_drop  = df_cmp["total_trades_test"] < df_cmp["total_trades_train"] * 0.5
-
-                    df_cmp["overfit"] = np.where(
-                        cond_score_drop | cond_ret_drop | cond_dd_worse | cond_trades_drop,
-                        "YES",
-                        "NO"
-                    )
-
-                    # === Overall score: prioritize TEST, use TRAIN as secondary ===
-                    # 70% weight on test_score, 30% on train_score
-                    df_cmp["overall_score"] = 0.7 * df_cmp["score_test"] + 0.3 * df_cmp["score_train"]
-
-                    # Rank by overall_score (this is your final "overall" ranking)
-                    df_cmp = df_cmp.sort_values("overall_score", ascending=False).reset_index(drop=True)
-                    df_cmp.insert(0, "overall_rank", df_cmp.index + 1)
-
-                    print(
-                        df_cmp[
-                            [
-                                "overall_rank",
-                                "train_rank",
-                                "test_rank",
-                                "train_config",
-                                "total_trades_train",
-                                "total_trades_test",
-                                "return_pct_train",
-                                "return_pct_test",
-                                "max_dd_pct_train",
-                                "max_dd_pct_test",
-                                "score_train",
-                                "score_test",
-                                "score_diff_pct",
-                                "overall_score",
-                                "overfit",
-                            ]
-                        ].to_string(index=False)
-                    )
-
-                    # === Save combined summary (this is your summary_combined.csv) ===
-                    try:
-                        df_cmp.to_csv("summary_combined.csv", index=False)
-                        print("\n[saved] summary_combined.csv")
-                    except Exception as e:
-                        print(f"[error saving summary_combined.csv] {e}")
-
-            print("\n[done] Backtest + train/test evaluation complete.")
+        # Top 3
+        print("\n" + "=" * 120)
+        print("TOP 3 CONFIGURATIONS (by win rate)")
+        print("=" * 120)
+        for _, row in df_all.head(3).iterrows():
+            print(f"\n#{int(row['rank'])}: {row['config']} ({row['strategy_mode']})")
+            print(f"    Trades: {row['total_trades']} | Win Rate: {row['win_rate_pct']}%")
+            print(f"    P&L: ${row['total_pl']} | Return: {row['return_pct']}%")
+            print(f"    DB: {row['db_path']}")
