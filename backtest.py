@@ -33,6 +33,10 @@ import pandas as pd
 import requests
 from dotenv import load_dotenv
 
+# NEW: parallelism
+import multiprocessing
+from joblib import Parallel, delayed
+
 # =========================
 # Config & Globals
 # =========================
@@ -65,7 +69,7 @@ START_EQUITY = float(os.getenv("START_EQUITY", "10000"))
 DAYS_BACK = int(os.getenv("DAYS_BACK", "1095"))
 
 # Approx spread in pips (round-trip) for EURUSD on M5
-SPREAD_PIPS = float(os.getenv("SPREAD_PIPS", "0.8"))
+SPREAD_PIPS = float(os.getenv("SPREAD_PIPS", "1.0"))
 
 # Train/test split fraction (e.g. 0.7 = first 70% train, last 30% test)
 TRAIN_FRACTION = float(os.getenv("TRAIN_FRACTION", "0.7"))
@@ -75,6 +79,9 @@ MIN_TRADES = int(os.getenv("MIN_TRADES", "200"))
 
 # Number of top configs (by score) to re-test on out-of-sample data
 TOP_N_TEST = int(os.getenv("TOP_N_TEST", "20"))
+
+# Optional: override n_jobs via ENV, else use cores-2
+N_JOBS_ENV = os.getenv("N_JOBS", "").strip()
 
 session = requests.Session()
 if not TOKEN:
@@ -90,6 +97,9 @@ os.makedirs(RESULTS_DIR, exist_ok=True)
 SUMMARY_RAW_PATH = os.path.join(RESULTS_DIR, "summary_raw.csv")
 SUMMARY_RANKED_PATH = os.path.join(RESULTS_DIR, "summary.csv")
 
+# Chunk size for parallel brute-force (for incremental CSV writing)
+CHUNK_SIZE = 20
+
 # =========================
 # Brute Force Parameter Ranges
 # =========================
@@ -97,7 +107,7 @@ SUMMARY_RANKED_PATH = os.path.join(RESULTS_DIR, "summary.csv")
 STRATEGY_MODES = ["FULL", "TREND_ONLY", "RANGE_ONLY", "NO_MTF"]
 
 RISK_PCT_RANGE = [0.01, 0.02, 0.03, 0.04, 0.05]      # 1% to 5% per trade
-SL_PIPS_RANGE   = [5, 10, 15, 20]                    # base SL in pips
+SL_PIPS_RANGE   = [5, 8, 10, 12, 15, 18, 20]         # base SL in pips
 RR_RANGE        = [1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0]  # TP = SL * RR
 DAILY_LOSSES_RANGE = [1, 2, 3, 4, 5]                 # max losing trades per day
 
@@ -984,6 +994,55 @@ def simulate_backtest(
 
 
 # =========================
+# Parallel worker for TRAIN
+# =========================
+
+def run_one_train_config(args):
+    (
+        strategy_mode,
+        risk_pct,
+        sl_pips,
+        rr,
+        daily_max_losses,
+        instr,
+        gran,
+        start_equity,
+        df_train,
+    ) = args
+
+    config_name = f"{strategy_mode}_R{risk_pct:.2f}_SL{sl_pips}_RR{rr}_DL{daily_max_losses}"
+    print(f"[TRAIN] {config_name} ...", flush=True)
+
+    try:
+        result = simulate_backtest(
+            df_train,
+            instrument=instr,
+            gran=gran,
+            start_equity=start_equity,
+            risk_pct=risk_pct,
+            sl_pips=sl_pips,
+            rr=rr,
+            daily_max_losses=daily_max_losses,
+            strategy_mode=strategy_mode,
+            config_name=config_name,
+        )
+        return result
+    except Exception as e:
+        print(f"[ERROR] TRAIN {config_name}: {e}")
+        return None
+
+
+# =========================
+# Helper: chunking
+# =========================
+
+def chunked(iterable, size):
+    """Yield successive chunks of length `size` from `iterable`."""
+    for i in range(0, len(iterable), size):
+        yield iterable[i : i + size]
+
+
+# =========================
 # Main
 # =========================
 
@@ -1017,52 +1076,77 @@ if __name__ == "__main__":
 
     print(f"\n[main] Starting TRAIN brute force with {len(PARAM_CONFIGS)} configurations...\n")
 
-    run_results = []
-
-    for idx, (strategy_mode, risk_pct, sl_pips, rr, daily_max_losses) in enumerate(PARAM_CONFIGS, 1):
+    # Build task list for joblib (only configs not done)
+    tasks = []
+    for (strategy_mode, risk_pct, sl_pips, rr, daily_max_losses) in PARAM_CONFIGS:
         config_name = f"{strategy_mode}_R{risk_pct:.2f}_SL{sl_pips}_RR{rr}_DL{daily_max_losses}"
-
         if config_name in done_configs:
-            print(f"[{idx}/{len(PARAM_CONFIGS)}] Skipping already completed TRAIN: {config_name}")
+            print(f"[skip] Already completed TRAIN: {config_name}")
             continue
 
-        print(
-            f"[{idx}/{len(PARAM_CONFIGS)}] TRAIN: {config_name}",
-            end=" ... ",
-            flush=True,
+        tasks.append(
+            (
+                strategy_mode,
+                risk_pct,
+                sl_pips,
+                rr,
+                daily_max_losses,
+                instr,
+                gran,
+                START_EQUITY,
+                df_train,
+            )
         )
 
-        try:
-            result = simulate_backtest(
-                df_train,
-                instrument=instr,
-                gran=gran,
-                start_equity=START_EQUITY,
-                risk_pct=risk_pct,
-                sl_pips=sl_pips,
-                rr=rr,
-                daily_max_losses=daily_max_losses,
-                strategy_mode=strategy_mode,
-                config_name=config_name,
-            )
-            run_results.append(result)
+    if not tasks:
+        print("[main] No new TRAIN configs to run.")
+        run_results = []
+    else:
+        CORES = multiprocessing.cpu_count()
+        if N_JOBS_ENV:
+            try:
+                N_JOBS = int(N_JOBS_ENV)
+            except ValueError:
+                N_JOBS = max(1, CORES - 2)
+        else:
+            N_JOBS = max(1, CORES - 2)
 
-            # --- Append this TRAIN result to summary_raw.csv immediately ---
-            df_row = pd.DataFrame([result])
-            write_header = not os.path.exists(SUMMARY_RAW_PATH)
-            df_row.to_csv(
-                SUMMARY_RAW_PATH,
-                mode="a",
-                index=False,
-                header=write_header,
+        print(f"[main] Using {N_JOBS} parallel workers out of {CORES} cores")
+        print(f"[main] Will run {len(tasks)} TRAIN configs in parallel (chunk size = {CHUNK_SIZE})\n")
+
+        run_results = []
+        total_tasks = len(tasks)
+        total_chunks = (total_tasks + CHUNK_SIZE - 1) // CHUNK_SIZE
+
+        # Run TRAIN configs in parallel, chunked, and append to summary_raw.csv incrementally
+        for chunk_idx, task_chunk in enumerate(chunked(tasks, CHUNK_SIZE), start=1):
+            print(f"[main] Running TRAIN chunk {chunk_idx}/{total_chunks} with {len(task_chunk)} configs")
+
+            results = Parallel(n_jobs=N_JOBS, backend="loky", verbose=10)(
+                delayed(run_one_train_config)(args) for args in task_chunk
             )
 
-            print(
-                f"✓ {result['total_trades']} trades | {result['win_rate_pct']}% WR | "
-                f"{result['return_pct']}% return | score={result['score']}"
-            )
-        except Exception as e:
-            print(f"✗ Error: {e}")
+            for result in results:
+                if result is None:
+                    continue
+
+                run_results.append(result)
+
+                # Append this result to summary_raw.csv (single-writer, main process only)
+                df_row = pd.DataFrame([result])
+                write_header = not os.path.exists(SUMMARY_RAW_PATH)
+                df_row.to_csv(
+                    SUMMARY_RAW_PATH,
+                    mode="a",
+                    index=False,
+                    header=write_header,
+                )
+
+                print(
+                    f"[TRAIN DONE] {result['config']}: "
+                    f"{result['total_trades']} trades | {result['win_rate_pct']}% WR | "
+                    f"{result['return_pct']}% return | score={result['score']}"
+                )
 
     # === Build ranked TRAIN summary from summary_raw.csv (all runs, old+new) ===
     if os.path.exists(SUMMARY_RAW_PATH):
@@ -1160,6 +1244,9 @@ if __name__ == "__main__":
                         strategy_mode=strategy_mode,
                         config_name=test_config_name,
                     )
+                    # attach original train config name so we can merge later
+                    res_test["train_config"] = base_config_name
+
                     test_results.append(res_test)
                     print(
                         f"✓ trades={res_test['total_trades']} | WR={res_test['win_rate_pct']}% | "
@@ -1221,7 +1308,7 @@ if __name__ == "__main__":
                     }
                 )
 
-                # TEST metrics (train_config was added to res_test in the test loop)
+                # TEST metrics (train_config added above)
                 test_cols = [
                     "train_config",
                     "total_trades",
