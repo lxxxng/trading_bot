@@ -8,12 +8,12 @@ Key features:
     * Trend: Donchian + ATR breakout + Volume confirmation + Swing detection
     * Range: Bollinger + RSI mean reversion
     * Multi-timeframe confirmation (M5 + M15 alignment, via resample if enabled)
-    * Adaptive SL/TP based on volatility (while keeping RR ratio)
+    * Adaptive SL/TP based on volatility, with SL based on ATR multiple
     * Time-of-day liquidity filter
 - Brute force over:
     * STRATEGY_MODE ∈ {FULL, TREND_ONLY, RANGE_ONLY, NO_MTF}
-    * RISK_PCT, SL_PIPS, RR (TP = SL * RR), DAILY_MAX_LOSSES
-- Logs trades & equity into per-config SQLite DBs under backtest_results/ (can be disabled)
+    * RISK_PCT, SL_ATR_MULTIPLIER, RR (TP = SL * RR), DAILY_MAX_LOSSES
+- (Optional) Logs trades & equity into per-config SQLite DBs under backtest_results/
 - Incrementally appends TRAIN results to summary_raw.csv to allow resume
 - Produces ranked summary.csv (sorted by SCORE = return_pct / max_dd_pct)
 - Train/test split:
@@ -50,16 +50,15 @@ REVERSE_SIGNALS = os.getenv("REVERSE_SIGNALS", "0").lower() in ("1", "true", "ye
 DEFAULT_INSTRUMENT = os.getenv("INSTRUMENT", "EUR_USD")
 DEFAULT_GRAN = os.getenv("GRANULARITY", "M5")
 
-# Enable/disable SQLite logging (trades + equity)
-# Default: OFF ("0")
-ENABLE_DB = os.getenv("ENABLE_DB", "0").lower() in ("1", "true", "yes", "y")
-
 # Strategy feature flags (base)
 USE_VOLUME_CONFIRM_BASE = os.getenv("USE_VOLUME_CONFIRM", "1").lower() in ("1", "true", "yes")
 USE_TIME_FILTER_BASE = os.getenv("USE_TIME_FILTER", "1").lower() in ("1", "true", "yes")
 USE_MULTI_TF_BASE = os.getenv("USE_MULTI_TF", "0").lower() in ("1", "true", "yes")
 USE_ADAPTIVE_SLTP_BASE = os.getenv("USE_ADAPTIVE_SLTP", "1").lower() in ("1", "true", "yes")
 USE_SWING_DETECT_BASE = os.getenv("USE_SWING_DETECT", "1").lower() in ("1", "true", "yes")
+
+# Disable DB writes by default
+WRITE_TO_DB = os.getenv("WRITE_TO_DB", "0").lower() in ("1", "true", "yes")
 
 BASE = (
     "https://api-fxpractice.oanda.com"
@@ -110,17 +109,37 @@ CHUNK_SIZE = 20
 
 STRATEGY_MODES = ["FULL", "TREND_ONLY", "RANGE_ONLY", "NO_MTF"]
 
-RISK_PCT_RANGE = [0.01, 0.02, 0.03, 0.04, 0.05]      # 1% to 5% per trade
-SL_PIPS_RANGE   = [5, 8, 10, 12, 15, 18, 20, 22, 25, 28, 30]         # base SL in pips
-RR_RANGE        = [1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0]      # TP = SL * RR
-DAILY_LOSSES_RANGE = [1, 2, 3, 4, 5]                         # max losing trades per day
+# Risk per trade (leave full range, you can narrow later if needed)
+RISK_PCT_RANGE = [0.01, 0.02, 0.03, 0.04, 0.05]
 
-# (strategy_mode, risk_pct, sl_pips, rr, daily_max_losses)
+# ATR-based SL multipliers (core + fractional + extended for strong trends)
+SL_ATR_MULTIPLIER_RANGE = [
+    1.0,
+    1.25,
+    1.5,
+    1.75,
+    2.0,
+    2.25,
+    2.5,
+    3.0,
+]
+
+# RR: TP = SL * RR
+RR_RANGE = [1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0]
+
+# Max losing trades per day
+DAILY_LOSSES_RANGE = [1, 2, 3, 4, 5]
+
+# Hard floor + ceiling for SL in pips (for safety)
+MIN_SL_PIPS = float(os.getenv("MIN_SL_PIPS", "4.0"))
+MAX_SL_PIPS = float(os.getenv("MAX_SL_PIPS", "60.0"))
+
+# (strategy_mode, risk_pct, sl_atr_mult, rr, daily_max_losses)
 PARAM_CONFIGS = list(
     itertools.product(
         STRATEGY_MODES,
         RISK_PCT_RANGE,
-        SL_PIPS_RANGE,
+        SL_ATR_MULTIPLIER_RANGE,
         RR_RANGE,
         DAILY_LOSSES_RANGE,
     )
@@ -172,7 +191,7 @@ def db_connect(db_path: str = DB_PATH):
 
 def db_init(db_path: str = DB_PATH):
     """Create tables for backtest logs (idempotent)."""
-    if not ENABLE_DB:
+    if not WRITE_TO_DB:
         return
 
     conn = db_connect(db_path)
@@ -225,7 +244,7 @@ def log_equity(
     db_path: str = DB_PATH,
 ):
     """Log equity using bar timestamp."""
-    if not ENABLE_DB:
+    if not WRITE_TO_DB:
         return
 
     conn = db_connect(db_path)
@@ -258,7 +277,7 @@ def log_trade_row(
     tp_pips: float,
     db_path: str = DB_PATH,
 ):
-    if not ENABLE_DB:
+    if not WRITE_TO_DB:
         return
 
     conn = db_connect(db_path)
@@ -570,7 +589,7 @@ def _resample_to_tf(df: pd.DataFrame, rule: str) -> pd.DataFrame:
 def _compute_signal_single_tf(
     df: pd.DataFrame,
     instrument: str,
-    sl_pips_fixed: float,
+    sl_atr_mult: float,
     rr: float,
     strategy_mode: str,
     use_volume_confirm: bool,
@@ -580,6 +599,7 @@ def _compute_signal_single_tf(
 ) -> Tuple[str, Dict[str, Any]]:
     """
     Single timeframe signal logic (trend/range, adaptive SL/TP, filters).
+    SL is based on ATR multiple, then clipped by MIN_SL_PIPS/MAX_SL_PIPS.
     Does NOT do multi-TF alignment.
     """
     if len(df) < 100:
@@ -600,6 +620,9 @@ def _compute_signal_single_tf(
     if use_time_filter and not is_liquid_hour(ts):
         return "FLAT", {"why": "illiquid_hour"}
 
+    # ATR in pips
+    atr_pips = atr_now / pip_value(instrument) if atr_now > 0 else 0.0
+
     trend_regime = atr_pct >= 70
     range_regime = atr_pct <= 30
 
@@ -615,6 +638,16 @@ def _compute_signal_single_tf(
     if strategy_mode == "RANGE_ONLY" and not range_regime:
         return "FLAT", {"why": "not_range_regime"}
 
+    # Helper: build SL/TP in pips from ATR
+    def build_sl_tp(atr_pips_val: float) -> Tuple[float, float]:
+        if atr_pips_val <= 0:
+            return 0.0, 0.0
+        sl_pips_raw = atr_pips_val * sl_atr_mult
+        sl_pips = max(MIN_SL_PIPS, min(sl_pips_raw, MAX_SL_PIPS))
+        tp_pips = sl_pips * rr
+        sl_pips, tp_pips = adaptive_sl_tp(atr_pct, sl_pips, tp_pips, use_adaptive_sltp)
+        return sl_pips, tp_pips
+
     # --- Trend regime: Donchian breakout ---
     if use_trend_block and trend_regime:
         up_break = (c > dc_hi.iloc[-2]) and (prev_c <= dc_hi.iloc[-3])
@@ -629,10 +662,9 @@ def _compute_signal_single_tf(
                 if not up_swing:
                     return "FLAT", {"why": "no_upswing"}
 
-            sl_pips = max(sl_pips_fixed, 2.0 * (atr_now / pip_value(instrument)))
-            tp_pips = sl_pips * rr
-            sl_pips, tp_pips = adaptive_sl_tp(atr_pct, sl_pips, tp_pips, use_adaptive_sltp)
-
+            sl_pips, tp_pips = build_sl_tp(atr_pips)
+            if sl_pips <= 0 or tp_pips <= 0:
+                return "FLAT", {"why": "invalid_sl_tp"}
             return "LONG", {"mode": "trend", "sl_pips": sl_pips, "tp_pips": tp_pips}
 
         if dn_break:
@@ -644,10 +676,9 @@ def _compute_signal_single_tf(
                 if not dn_swing:
                     return "FLAT", {"why": "no_dnswing"}
 
-            sl_pips = max(sl_pips_fixed, 2.0 * (atr_now / pip_value(instrument)))
-            tp_pips = sl_pips * rr
-            sl_pips, tp_pips = adaptive_sl_tp(atr_pct, sl_pips, tp_pips, use_adaptive_sltp)
-
+            sl_pips, tp_pips = build_sl_tp(atr_pips)
+            if sl_pips <= 0 or tp_pips <= 0:
+                return "FLAT", {"why": "invalid_sl_tp"}
             return "SHORT", {"mode": "trend", "sl_pips": sl_pips, "tp_pips": tp_pips}
 
     # --- Range regime: Bollinger + RSI ---
@@ -656,18 +687,16 @@ def _compute_signal_single_tf(
 
         # Long mean-reversion
         if (c < bb_lo.iloc[-1]) and (rsi_val < 30):
-            sl_pips = sl_pips_fixed
-            tp_pips = sl_pips * rr
-            sl_pips, tp_pips = adaptive_sl_tp(atr_pct, sl_pips, tp_pips, use_adaptive_sltp)
-
+            sl_pips, tp_pips = build_sl_tp(atr_pips)
+            if sl_pips <= 0 or tp_pips <= 0:
+                return "FLAT", {"why": "invalid_sl_tp"}
             return "LONG", {"mode": "range", "sl_pips": sl_pips, "tp_pips": tp_pips}
 
         # Short mean-reversion
         if (c > bb_up.iloc[-1]) and (rsi_val > 70):
-            sl_pips = sl_pips_fixed
-            tp_pips = sl_pips * rr
-            sl_pips, tp_pips = adaptive_sl_tp(atr_pct, sl_pips, tp_pips, use_adaptive_sltp)
-
+            sl_pips, tp_pips = build_sl_tp(atr_pips)
+            if sl_pips <= 0 or tp_pips <= 0:
+                return "FLAT", {"why": "invalid_sl_tp"}
             return "SHORT", {"mode": "range", "sl_pips": sl_pips, "tp_pips": tp_pips}
 
     return "FLAT", {"why": "no_setup"}
@@ -676,7 +705,7 @@ def _compute_signal_single_tf(
 def compute_signal(
     df: pd.DataFrame,
     instrument: str,
-    sl_pips_fixed: float,
+    sl_atr_mult: float,
     rr: float,
     strategy_mode: str,
 ) -> Tuple[str, Dict[str, Any]]:
@@ -696,7 +725,7 @@ def compute_signal(
     signal_main, meta_main = _compute_signal_single_tf(
         df,
         instrument,
-        sl_pips_fixed,
+        sl_atr_mult,
         rr,
         strategy_mode,
         use_volume_confirm,
@@ -721,7 +750,7 @@ def compute_signal(
     signal_m15, meta_m15 = _compute_signal_single_tf(
         df_m15,
         instrument,
-        sl_pips_fixed,
+        sl_atr_mult,
         rr,
         strategy_mode,
         use_volume_confirm,
@@ -766,7 +795,7 @@ def simulate_backtest(
     gran: str,
     start_equity: float,
     risk_pct: float,
-    sl_pips: float,
+    sl_atr_mult: float,
     rr: float,
     daily_max_losses: int,
     strategy_mode: str,
@@ -774,8 +803,8 @@ def simulate_backtest(
 ) -> Dict[str, Any]:
     """Run bar-by-bar backtest with given parameters and strategy mode."""
 
-    # Create unique DB for this config (only if DB enabled)
-    if ENABLE_DB:
+    # Create unique DB for this config (or disable via WRITE_TO_DB)
+    if WRITE_TO_DB:
         safe_name = config_name.replace(".", "_").replace(" ", "_")
         db_path = os.path.join(RESULTS_DIR, f"{safe_name}.db")
         db_init(db_path)
@@ -798,8 +827,10 @@ def simulate_backtest(
     daily_loss_count = 0
     daily_limit_hit = False  # stop new entries for the day once hit
 
-    # For reporting: base TP for this config (before adaptive scaling)
-    base_tp_pips = sl_pips * rr
+    # For reporting: average SL/TP pips encountered (approx)
+    sl_pips_sum = 0.0
+    tp_pips_sum = 0.0
+    sl_tp_count = 0
 
     for i in range(100, len(df)):
         bar = df.iloc[i]
@@ -870,8 +901,8 @@ def simulate_backtest(
                     pl=pl,
                     result=result,
                     risk_pct=risk_pct,
-                    sl_pips=sl_pips,
-                    tp_pips=base_tp_pips,
+                    sl_pips=position["sl_pips_pips"],
+                    tp_pips=position["tp_pips_pips"],
                     db_path=db_path,
                 )
 
@@ -899,7 +930,7 @@ def simulate_backtest(
         # 5) Check for new signal (if no open position & daily loss limit not hit)
         if position is None and not daily_limit_hit:
             window = df.iloc[: i + 1].copy()
-            signal, meta = compute_signal(window, instrument, sl_pips, rr, strategy_mode)
+            signal, meta = compute_signal(window, instrument, sl_atr_mult, rr, strategy_mode)
             if signal not in ("LONG", "SHORT"):
                 continue
 
@@ -908,8 +939,10 @@ def simulate_backtest(
             else:
                 actual_side = signal
 
-            sl_pips_calc = float(meta.get("sl_pips", sl_pips))
-            tp_pips_calc = float(meta.get("tp_pips", base_tp_pips))
+            sl_pips_calc = float(meta.get("sl_pips", 0.0))
+            tp_pips_calc = float(meta.get("tp_pips", 0.0))
+            if sl_pips_calc <= 0 or tp_pips_calc <= 0:
+                continue
 
             units = position_size(equity, sl_pips_calc, instrument, risk_pct)
             if units <= 0:
@@ -931,9 +964,14 @@ def simulate_backtest(
                 "entry": entry,
                 "sl": sl_price,
                 "tp": tp_price,
+                "sl_pips_pips": sl_pips_calc,
+                "tp_pips_pips": tp_pips_calc,
             }
 
             trade_count += 1
+            sl_pips_sum += sl_pips_calc
+            tp_pips_sum += tp_pips_calc
+            sl_tp_count += 1
 
     # 6) Close any remaining open position at last bar close
     if position is not None:
@@ -966,8 +1004,8 @@ def simulate_backtest(
             pl=pl,
             result=result,
             risk_pct=risk_pct,
-            sl_pips=sl_pips,
-            tp_pips=base_tp_pips,
+            sl_pips=position["sl_pips_pips"],
+            tp_pips=position["tp_pips_pips"],
             db_path=db_path,
         )
 
@@ -981,6 +1019,9 @@ def simulate_backtest(
     win_rate = (win_count / trade_count * 100) if trade_count > 0 else 0.0
     return_pct = ((equity - start_equity) / start_equity * 100) if start_equity > 0 else 0.0
     pl_per_trade = (total_pl / trade_count) if trade_count > 0 else 0.0
+
+    avg_sl_pips = (sl_pips_sum / sl_tp_count) if sl_tp_count > 0 else 0.0
+    avg_tp_pips = (tp_pips_sum / sl_tp_count) if sl_tp_count > 0 else 0.0
 
     # Simple robustness score: return / max_dd
     if max_dd_pct > 0:
@@ -1003,8 +1044,10 @@ def simulate_backtest(
         "score": round(score, 4),
         "db_path": db_path,
         "risk_pct": risk_pct,
-        "sl_pips": sl_pips,
-        "tp_pips": base_tp_pips,
+        "sl_atr_mult": sl_atr_mult,
+        "rr": rr,
+        "avg_sl_pips": round(avg_sl_pips, 2),
+        "avg_tp_pips": round(avg_tp_pips, 2),
         "daily_max_losses": daily_max_losses,
     }
 
@@ -1017,7 +1060,7 @@ def run_one_train_config(args):
     (
         strategy_mode,
         risk_pct,
-        sl_pips,
+        sl_atr_mult,
         rr,
         daily_max_losses,
         instr,
@@ -1026,7 +1069,9 @@ def run_one_train_config(args):
         df_train,
     ) = args
 
-    config_name = f"{strategy_mode}_R{risk_pct:.2f}_SL{sl_pips}_RR{rr}_DL{daily_max_losses}"
+    config_name = (
+        f"{strategy_mode}_R{risk_pct:.2f}_ATR{sl_atr_mult}_RR{rr}_DL{daily_max_losses}"
+    )
     print(f"[TRAIN] {config_name} ...", flush=True)
 
     try:
@@ -1036,7 +1081,7 @@ def run_one_train_config(args):
             gran=gran,
             start_equity=start_equity,
             risk_pct=risk_pct,
-            sl_pips=sl_pips,
+            sl_atr_mult=sl_atr_mult,
             rr=rr,
             daily_max_losses=daily_max_losses,
             strategy_mode=strategy_mode,
@@ -1077,7 +1122,6 @@ if __name__ == "__main__":
     df_test = df_hist.iloc[split_idx:].reset_index(drop=True)
 
     print(f"[main] Train size: {len(df_train)} bars, Test size: {len(df_test)} bars")
-    print(f"[main] ENABLE_DB = {ENABLE_DB}")
 
     # --- Load existing partial results to enable resume (TRAIN phase) ---
     done_configs = set()
@@ -1095,8 +1139,10 @@ if __name__ == "__main__":
 
     # Build task list for joblib (only configs not done)
     tasks = []
-    for (strategy_mode, risk_pct, sl_pips, rr, daily_max_losses) in PARAM_CONFIGS:
-        config_name = f"{strategy_mode}_R{risk_pct:.2f}_SL{sl_pips}_RR{rr}_DL{daily_max_losses}"
+    for (strategy_mode, risk_pct, sl_atr_mult, rr, daily_max_losses) in PARAM_CONFIGS:
+        config_name = (
+            f"{strategy_mode}_R{risk_pct:.2f}_ATR{sl_atr_mult}_RR{rr}_DL{daily_max_losses}"
+        )
         if config_name in done_configs:
             print(f"[skip] Already completed TRAIN: {config_name}")
             continue
@@ -1105,7 +1151,7 @@ if __name__ == "__main__":
             (
                 strategy_mode,
                 risk_pct,
-                sl_pips,
+                sl_atr_mult,
                 rr,
                 daily_max_losses,
                 instr,
@@ -1207,6 +1253,12 @@ if __name__ == "__main__":
                         "return_pct",
                         "max_dd_pct",
                         "score",
+                        "risk_pct",
+                        "sl_atr_mult",
+                        "rr",
+                        "daily_max_losses",
+                        "avg_sl_pips",
+                        "avg_tp_pips",
                     ]
                 ].to_string(index=False)
             )
@@ -1225,6 +1277,10 @@ if __name__ == "__main__":
                     f"    Trades: {row['total_trades']} | Win Rate: {row['win_rate_pct']}% | "
                     f"Return: {row['return_pct']}% | Max DD: {row['max_dd_pct']}% | Score: {row['score']}"
                 )
+                print(
+                    f"    ATR SL mult: {row['sl_atr_mult']} | RR: {row['rr']} "
+                    f"| Avg SL: {row['avg_sl_pips']} pips | Avg TP: {row['avg_tp_pips']} pips"
+                )
                 print(f"    DB: {row['db_path']}")
 
             # === Re-test top N configs on TEST set ===
@@ -1239,9 +1295,8 @@ if __name__ == "__main__":
                 # Recover parameters
                 strategy_mode = row["strategy_mode"]
                 risk_pct = float(row["risk_pct"])
-                sl_pips = float(row["sl_pips"])
-                tp_pips = float(row["tp_pips"])
-                rr = tp_pips / sl_pips if sl_pips > 0 else 1.0
+                sl_atr_mult = float(row["sl_atr_mult"])
+                rr = float(row["rr"])
                 daily_max_losses = int(row["daily_max_losses"])
                 base_config_name = str(row["config"])
                 test_config_name = base_config_name + "_TEST"
@@ -1255,7 +1310,7 @@ if __name__ == "__main__":
                         gran=gran,
                         start_equity=START_EQUITY,
                         risk_pct=risk_pct,
-                        sl_pips=sl_pips,
+                        sl_atr_mult=sl_atr_mult,
                         rr=rr,
                         daily_max_losses=daily_max_losses,
                         strategy_mode=strategy_mode,
@@ -1295,6 +1350,10 @@ if __name__ == "__main__":
                             "return_pct",
                             "max_dd_pct",
                             "score",
+                            "risk_pct",
+                            "sl_atr_mult",
+                            "rr",
+                            "daily_max_losses",
                         ]
                     ].to_string(index=False)
                 )
@@ -1312,6 +1371,10 @@ if __name__ == "__main__":
                     "max_dd_pct",
                     "score",
                     "rank",          # train rank from summary.csv
+                    "risk_pct",
+                    "sl_atr_mult",
+                    "rr",
+                    "daily_max_losses",
                 ]
                 df_train_merge = df_all[train_cols].copy()
                 df_train_merge = df_train_merge.rename(
@@ -1322,6 +1385,10 @@ if __name__ == "__main__":
                         "max_dd_pct": "max_dd_pct_train",
                         "score": "score_train",
                         "rank": "train_rank",
+                        "risk_pct": "risk_pct_train",
+                        "sl_atr_mult": "sl_atr_mult_train",
+                        "rr": "rr_train",
+                        "daily_max_losses": "daily_max_losses_train",
                     }
                 )
 
@@ -1385,6 +1452,10 @@ if __name__ == "__main__":
                                 "train_rank",
                                 "test_rank",
                                 "train_config",
+                                "risk_pct_train",
+                                "sl_atr_mult_train",
+                                "rr_train",
+                                "daily_max_losses_train",
                                 "total_trades_train",
                                 "total_trades_test",
                                 "return_pct_train",
