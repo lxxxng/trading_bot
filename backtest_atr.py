@@ -107,10 +107,10 @@ CHUNK_SIZE = 20
 # Brute Force Parameter Ranges
 # =========================
 
-STRATEGY_MODES = ["FULL", "RANGE_ONLY", "NO_MTF", "TREND_ONLY"]
+STRATEGY_MODES = ["FULL"]
 
 # Risk per trade (leave full range, you can narrow later if needed)
-RISK_PCT_RANGE = [0.01, 0.02, 0.03, 0.04, 0.05]
+RISK_PCT_RANGE = [0.01, 0.02, 0.005, 0.015]
 
 # ATR-based SL multipliers (core + fractional + extended for strong trends)
 SL_ATR_MULTIPLIER_RANGE = [
@@ -121,14 +121,13 @@ SL_ATR_MULTIPLIER_RANGE = [
     2.0,
     2.25,
     2.5,
-    3.0,
 ]
 
 # RR: TP = SL * RR
-RR_RANGE = [1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0]
+RR_RANGE = [1.5, 1.75, 2.0, 2.5, 3.0]
 
 # Max losing trades per day
-DAILY_LOSSES_RANGE = [1, 2, 3, 4, 5]
+DAILY_LOSSES_RANGE = [1, 2, 3]
 
 # Hard floor + ceiling for SL in pips (for safety)
 MIN_SL_PIPS = float(os.getenv("MIN_SL_PIPS", "4.0"))
@@ -1183,7 +1182,9 @@ if __name__ == "__main__":
 
         # Run TRAIN configs in parallel, chunked, and append to summary_raw.csv incrementally
         for chunk_idx, task_chunk in enumerate(chunked(tasks, CHUNK_SIZE), start=1):
-            print(f"[main] Running TRAIN chunk {chunk_idx}/{total_chunks} with {len(task_chunk)} configs")
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"[{now}] Running TRAIN chunk {chunk_idx}/{total_chunks} with {len(task_chunk)} configs")
+
 
             results = Parallel(n_jobs=N_JOBS, backend="loky", verbose=10)(
                 delayed(run_one_train_config)(args) for args in task_chunk

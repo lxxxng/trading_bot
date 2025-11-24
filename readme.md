@@ -28,6 +28,9 @@ curl http://localhost:8000/equity
 
 # Activate environment
 Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+python -m venv env
+pip install -r requirements.txt
+
 .venv\Scripts\activate
 
 .venv\Scripts\deactivate
