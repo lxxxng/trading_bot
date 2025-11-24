@@ -36,5 +36,8 @@ pip install -r requirements.txt
 .venv\Scripts\deactivate
 
 
+record 71, 73 issue
+
+
 
 
