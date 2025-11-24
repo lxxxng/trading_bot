@@ -1068,9 +1068,11 @@ def run_one_train_config(args):
         df_train,
     ) = args
 
+    risk_str = f"{risk_pct:.3f}".rstrip('0').rstrip('.')
     config_name = (
-        f"{strategy_mode}_R{risk_pct:.2f}_ATR{sl_atr_mult}_RR{rr}_DL{daily_max_losses}"
+        f"{strategy_mode}_R{risk_str}_ATR{sl_atr_mult}_RR{rr}_DL{daily_max_losses}"
     )
+
     print(f"[TRAIN] {config_name} ...", flush=True)
 
     try:
@@ -1139,9 +1141,12 @@ if __name__ == "__main__":
     # Build task list for joblib (only configs not done)
     tasks = []
     for (strategy_mode, risk_pct, sl_atr_mult, rr, daily_max_losses) in PARAM_CONFIGS:
+        # same normalization as in run_one_train_config
+        risk_str = f"{risk_pct:.3f}".rstrip('0').rstrip('.')
         config_name = (
-            f"{strategy_mode}_R{risk_pct:.2f}_ATR{sl_atr_mult}_RR{rr}_DL{daily_max_losses}"
+            f"{strategy_mode}_R{risk_str}_ATR{sl_atr_mult}_RR{rr}_DL{daily_max_losses}"
         )
+
         if config_name in done_configs:
             print(f"[skip] Already completed TRAIN: {config_name}")
             continue
@@ -1159,6 +1164,7 @@ if __name__ == "__main__":
                 df_train,
             )
         )
+
 
     if not tasks:
         print("[main] No new TRAIN configs to run.")
