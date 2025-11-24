@@ -107,7 +107,7 @@ CHUNK_SIZE = 20
 # Brute Force Parameter Ranges
 # =========================
 
-STRATEGY_MODES = ["FULL", "TREND_ONLY", "RANGE_ONLY", "NO_MTF"]
+STRATEGY_MODES = ["FULL", "RANGE_ONLY", "NO_MTF", "TREND_ONLY"]
 
 # Risk per trade (leave full range, you can narrow later if needed)
 RISK_PCT_RANGE = [0.01, 0.02, 0.03, 0.04, 0.05]
